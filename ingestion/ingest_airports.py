@@ -12,7 +12,7 @@ directement d'un objet Python de l'étape d'avant.
 """
 from datetime import date
 
-from common import fetch_csv, get_connection
+from common import INIT_DATE, fetch_csv, get_connection
 
 AIRPORT_COLS = ["iata_code", "airport_name", "city", "country"]
 
@@ -25,11 +25,10 @@ def _snapshot_file(day: date = None, init: bool = False):
 
 
 def ingest_bronze(day: date = None, init: bool = False):
-    # TODO : Doit télécharger le snapshot du jour vers bronze/ (ou vers init/).
-    # utiliser fetch_csv() de common.py (à implémenter aussi) pour rapatrier la données.
-
+    """Télécharge le snapshot du jour (ou de init/) vers bronze/, s'il n'y est pas déjà."""
     subdir, filename = _snapshot_file(day, init)
     fetch_csv(subdir, filename)
+
 
 def create_silver_table(con):
     # insert_timestamp / update_timestamp : colonnes techniques à reproduire sur TOUTES vos
@@ -57,7 +56,7 @@ def ingest_silver(day: date = None, init: bool = False):
     """Relit le snapshot depuis bronze/ et l'upsert dans silver_airports."""
     subdir, filename = _snapshot_file(day, init)
     df = fetch_csv(subdir, filename)  # déjà en cache local : pas de nouveau téléchargement
-    snapshot_date = date(2025, 8, 31) if init else day
+    snapshot_date = INIT_DATE if init else day
 
     df = df.copy()
     df["is_active"] = True
@@ -68,14 +67,17 @@ def ingest_silver(day: date = None, init: bool = False):
 
     # Upsert : on insère les nouvelles lignes, on met à jour celles dont la clé existe déjà.
     # insert_timestamp n'apparaît PAS dans le SET du conflit : sur un conflit (ligne déjà
-    # connue), on veut garder sa valeur d'origine, pas l'écraser. update_timestamp, lui, est
-    # rafraîchi à chaque passage, qu'il y ait eu un vrai changement de valeur ou non.
+    # connue), on veut garder sa valeur d'origine, pas l'écraser. update_timestamp, lui, n'est
+    # rafraîchi que si la ligne change réellement (clause WHERE du DO UPDATE) : sinon il
+    # bougerait tous les jours sur les 80 aéroports et ne permettrait plus de repérer ceux qui
+    # ont vraiment été modifiés.
     # deleted_date est remis à NULL sur un conflit : la ligne est présente dans le snapshot du
     # jour, donc active — si elle avait été désactivée puis réapparaissait (pas le cas dans ce
     # jeu de données, mais une vraie source pourrait le faire), elle redevient active proprement.
     update_cols = AIRPORT_COLS + ["is_active"]
     set_clause = ", ".join(f"{c} = excluded.{c}" for c in update_cols)
     set_clause += ", deleted_date = NULL, update_timestamp = now()"
+    changed = " OR ".join(f"silver_airports.{c} IS DISTINCT FROM excluded.{c}" for c in update_cols)
 
     con.execute(f"""
         INSERT INTO silver_airports (
@@ -83,7 +85,7 @@ def ingest_silver(day: date = None, init: bool = False):
         )
         SELECT airport_id, {", ".join(update_cols)}, NULL, now(), now()
         FROM snapshot
-        ON CONFLICT (airport_id) DO UPDATE SET {set_clause}
+        ON CONFLICT (airport_id) DO UPDATE SET {set_clause} WHERE {changed}
     """)
 
     # Les aéroports absents du snapshot du jour ont disparu de la source : on les désactive,
